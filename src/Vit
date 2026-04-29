@@ -1,0 +1,441 @@
+/**
+ * ViT Analyzer - C++ Implementation
+ * Converted from vit_analyzer.py
+ *
+ * Dependencies:
+ *   - LibTorch (PyTorch C++ API): https://pytorch.org/cppdocs/
+ *   - OpenCV:                     https://opencv.org/
+ *
+ * Build example (CMake):
+ *   find_package(Torch REQUIRED)
+ *   find_package(OpenCV REQUIRED)
+ *   target_link_libraries(your_target ${TORCH_LIBRARIES} ${OpenCV_LIBS})
+ */
+
+#include <torch/torch.h>
+#include <torch/script.h>
+#include <opencv2/opencv.hpp>
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <map>
+#include <optional>
+#include <algorithm>
+#include <stdexcept>
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
+// ─────────────────────────────────────────────
+// Data structures
+// ─────────────────────────────────────────────
+
+struct Prediction {
+    std::string food_class;
+    float       confidence;
+    int         index;
+};
+
+struct AnalysisResult {
+    std::string              model;
+    std::vector<Prediction>  predictions;       // filtered by threshold
+    std::optional<Prediction> top_prediction;
+    std::map<std::string, float> confidence_scores;
+    std::vector<int>         input_shape;       // {H, W, C}
+    std::string              error;             // empty = no error
+};
+
+struct FineTuneInfo {
+    std::string              current_model;
+    int                      num_classes;
+    std::string              dataset_recommendation;
+    std::vector<std::string> training_tips;
+    std::map<std::string, std::string> hyperparameters;
+};
+
+// Mirrors ViTImageProcessor settings loaded in Python via
+//   ViTImageProcessor.from_pretrained(model_name)
+// The default google/vit-base-patch16-224 processor uses these values.
+struct ProcessorConfig {
+    int   image_size   = 224;           // resize target (square)
+    float mean[3]      = { 0.5f, 0.5f, 0.5f };  // RGB normalisation mean
+    float std_dev[3]   = { 0.5f, 0.5f, 0.5f };  // RGB normalisation std
+    bool  do_resize    = true;
+    bool  do_normalize = true;
+    std::string model_name;             // originating model name (for logging)
+};
+
+// ─────────────────────────────────────────────
+// ViTAnalyzer class
+// ─────────────────────────────────────────────
+
+class ViTAnalyzer {
+public:
+    /**
+     * Constructor
+     *
+     * @param model_path   Path to a TorchScript-exported ViT model (.pt file).
+     *                     Export from Python with:
+     *                       traced = torch.jit.trace(model, example_input)
+     *                       traced.save("vit_food.pt")
+     * @param threshold    Minimum confidence to include in filtered predictions.
+     */
+    explicit ViTAnalyzer(const std::string& model_path,
+                         float threshold = 0.5f)
+        : confidence_threshold_(threshold)
+    {
+        food_classes_ = load_food_classes();
+        device_       = torch::cuda::is_available()
+                            ? torch::Device(torch::kCUDA)
+                            : torch::Device(torch::kCPU);
+
+        load_model(model_path);
+        processor_ = load_processor(model_path);   // mirrors _load_processor()
+
+        std::cout << "[ViTAnalyzer] Initialized on device: "
+                  << (torch::cuda::is_available() ? "CUDA" : "CPU") << "\n";
+        std::cout << "[ViTAnalyzer] Processor: image_size=" << processor_.image_size
+                  << "  mean=[" << processor_.mean[0] << "," << processor_.mean[1]
+                  << "," << processor_.mean[2] << "]"
+                  << "  std=["  << processor_.std_dev[0] << "," << processor_.std_dev[1]
+                  << "," << processor_.std_dev[2] << "]\n";
+    }
+
+    // ── Public API ────────────────────────────
+
+    /**
+     * Analyse a food image (BGR, uint8, as loaded by cv::imread).
+     * Returns top_k predictions sorted by confidence (descending).
+     */
+    AnalysisResult analyze(const cv::Mat& image, int top_k = 5)
+    {
+        AnalysisResult result;
+        result.model = "ViT";
+        result.input_shape = { image.rows, image.cols, image.channels() };
+
+        try {
+            // preprocess_image now uses processor_ config, matching _load_processor()
+            torch::Tensor pixel_values = preprocess_image(image);
+
+            torch::Tensor logits, probs;
+            {
+                torch::NoGradGuard no_grad;
+                auto output = model_.forward({ pixel_values });
+                logits = output.toTensor();                          // [1, num_classes]
+                probs  = torch::softmax(logits, /*dim=*/1);
+            }
+
+            // top-k — capped at num_classes, same as Python's min(top_k, len(self.food_classes))
+            auto [top_probs, top_indices] =
+                torch::topk(probs,
+                            std::min(top_k, (int)food_classes_.size()),
+                            /*dim=*/1);
+
+            int k = top_probs.size(1);
+            std::vector<Prediction> all_preds;
+            all_preds.reserve(k);
+
+            for (int i = 0; i < k; ++i) {
+                int   idx  = top_indices[0][i].item<int>();
+                float prob = top_probs[0][i].item<float>();
+                all_preds.push_back({ food_classes_[idx], prob, idx });
+            }
+
+            // ── confidence_scores: ALL top-k predictions, regardless of threshold ──
+            // Python: {p['class']: p['confidence'] for p in predictions}
+            // where `predictions` = the full unfiltered all_preds list
+            for (const auto& p : all_preds)
+                result.confidence_scores[p.food_class] = p.confidence;
+
+            // ── filtered predictions: only those >= confidence_threshold ──
+            // Python: filtered_predictions = [p for p in predictions
+            //                                 if p['confidence'] >= self.confidence_threshold]
+            for (const auto& p : all_preds)
+                if (p.confidence >= confidence_threshold_)
+                    result.predictions.push_back(p);
+
+            // ── top_prediction: first filtered entry (or None if empty) ──
+            // Python: filtered_predictions[0] if filtered_predictions else None
+            if (!result.predictions.empty())
+                result.top_prediction = result.predictions.front();
+
+        } catch (const std::exception& e) {
+            result.error = e.what();
+            std::cerr << "[ViTAnalyzer] Error in analyze(): " << e.what() << "\n";
+        }
+
+        return result;
+    }
+
+    /**
+     * Map a specific food class to a broader category.
+     */
+    std::string get_food_category(const std::optional<Prediction>& prediction) const
+    {
+        if (!prediction.has_value()) return "unknown";
+
+        std::string fc = prediction->food_class;
+        std::transform(fc.begin(), fc.end(), fc.begin(), ::tolower);
+
+        static const std::map<std::string, std::vector<std::string>> category_map = {
+            { "desserts",       { "cake","pudding","mousse","creme","tart","pie","cookies","donuts","waffles","pancakes" } },
+            { "main_dishes",    { "chicken","beef","pork","fish","salmon","steak","ribs","tartare","carpaccio" } },
+            { "appetizers",     { "salad","soup","wings","calamari","oysters","scallops","mussels","bruschetta" } },
+            { "asian_cuisine",  { "sushi","pho","ramen","pad_thai","bibimbap","takoyaki","gyoza","dumplings" } },
+            { "italian_cuisine",{ "pizza","pasta","lasagna","ravioli","risotto","gnocchi","carbonara","bolognese" } },
+            { "mexican_cuisine",{ "tacos","quesadilla","burrito","nachos","huevos","guacamole" } },
+            { "breakfast",      { "eggs","pancakes","waffles","french_toast","omelette" } },
+            { "sides",          { "fries","onion_rings","garlic_bread","macaroni","rice","potato" } },
+            { "seafood",        { "fish","salmon","shrimp","crab","lobster","mussels","oysters","scallops" } },
+        };
+
+        for (const auto& [category, keywords] : category_map)
+            for (const auto& kw : keywords)
+                if (fc.find(kw) != std::string::npos)
+                    return category;
+
+        return "other";
+    }
+
+    /**
+     * Return fine-tuning guidance (mirrors Python's fine_tune_info()).
+     */
+    FineTuneInfo fine_tune_info() const
+    {
+        FineTuneInfo info;
+        info.current_model           = model_name_;
+        info.num_classes             = static_cast<int>(food_classes_.size());
+        info.dataset_recommendation  = "Food-101 dataset";
+        info.training_tips = {
+            "Use Food-101 dataset for food-specific fine-tuning",
+            "Consider data augmentation for better generalization",
+            "Start with a lower learning rate (1e-5)",
+            "Use early stopping to prevent overfitting",
+            "Fine-tune on a subset first, then full dataset"
+        };
+        info.hyperparameters = {
+            { "learning_rate", "1e-5 to 5e-5" },
+            { "batch_size",    "16-32"         },
+            { "epochs",        "10-20"         },
+            { "weight_decay",  "0.01"          }
+        };
+        return info;
+    }
+
+    // Accessors
+    const std::vector<std::string>& food_classes() const { return food_classes_; }
+    float confidence_threshold() const { return confidence_threshold_; }
+    void  set_confidence_threshold(float t) { confidence_threshold_ = t; }
+
+private:
+    // ── Private helpers ───────────────────────
+
+    void load_model(const std::string& model_path)
+    {
+        if (!fs::exists(model_path))
+            throw std::runtime_error("[ViTAnalyzer] Model file not found: " + model_path);
+
+        try {
+            model_ = torch::jit::load(model_path, device_);
+            model_.eval();
+            model_name_ = model_path;
+            std::cout << "[ViTAnalyzer] Model loaded: " << model_path << "\n";
+        } catch (const c10::Error& e) {
+            throw std::runtime_error("[ViTAnalyzer] Failed to load model: " +
+                                     std::string(e.what()));
+        }
+    }
+
+    /**
+     * Mirrors Python's _load_processor().
+     *
+     * Python:
+     *   def _load_processor(self) -> ViTImageProcessor:
+     *       processor = ViTImageProcessor.from_pretrained(self.model_name)
+     *       return processor
+     *
+     * In C++ we can't call into HuggingFace directly, so we return a
+     * ProcessorConfig that encodes the same default values that
+     * ViTImageProcessor uses for "google/vit-base-patch16-224":
+     *   image_size = 224, mean = [0.5, 0.5, 0.5], std = [0.5, 0.5, 0.5]
+     *
+     * If you fine-tune with a different processor, update these values to match.
+     */
+    static ProcessorConfig load_processor(const std::string& model_name)
+    {
+        ProcessorConfig cfg;
+        cfg.model_name   = model_name;
+        cfg.image_size   = 224;
+        cfg.mean[0]      = 0.5f;  cfg.mean[1]    = 0.5f;  cfg.mean[2]    = 0.5f;
+        cfg.std_dev[0]   = 0.5f;  cfg.std_dev[1] = 0.5f;  cfg.std_dev[2] = 0.5f;
+        cfg.do_resize    = true;
+        cfg.do_normalize = true;
+        return cfg;
+    }
+
+    /**
+     * Preprocess a BGR cv::Mat into a normalised float tensor [1, 3, H, H].
+     *
+     * Mirrors Python's preprocess_image() which calls self.processor():
+     *   inputs = self.processor(pil_image, return_tensors="pt")
+     *
+     * Steps match ViTImageProcessor defaults:
+     *   1. Resize to processor_.image_size x processor_.image_size
+     *   2. BGR -> RGB  (cv::imread gives BGR; PIL gives RGB)
+     *   3. uint8 -> float32 in [0, 1]
+     *   4. HWC -> CHW
+     *   5. Normalise per-channel: (x - mean) / std
+     */
+    torch::Tensor preprocess_image(const cv::Mat& bgr_image) const
+    {
+        const int sz = processor_.image_size;
+
+        // 1. Resize (do_resize)
+        cv::Mat resized;
+        cv::resize(bgr_image, resized, { sz, sz });
+
+        // 2. BGR → RGB  (PIL loads as RGB; cv::imread gives BGR)
+        cv::Mat rgb;
+        cv::cvtColor(resized, rgb, cv::COLOR_BGR2RGB);
+
+        // 3. uint8 → float32 in [0, 1]
+        cv::Mat float_img;
+        rgb.convertTo(float_img, CV_32FC3, 1.0 / 255.0);
+
+        // 4. HWC → CHW tensor
+        torch::Tensor tensor = torch::from_blob(
+            float_img.data,
+            { 1, sz, sz, 3 },
+            torch::kFloat32
+        ).clone();
+        tensor = tensor.permute({ 0, 3, 1, 2 }); // [1,H,W,C] → [1,C,H,W]
+
+        // 5. Normalise per-channel: (x - mean) / std  (do_normalize)
+        //    Matches ViTImageProcessor with mean=[0.5,0.5,0.5] std=[0.5,0.5,0.5]
+        if (processor_.do_normalize) {
+            auto mean = torch::tensor(
+                { processor_.mean[0], processor_.mean[1], processor_.mean[2] }
+            ).view({ 1, 3, 1, 1 });
+            auto std = torch::tensor(
+                { processor_.std_dev[0], processor_.std_dev[1], processor_.std_dev[2] }
+            ).view({ 1, 3, 1, 1 });
+            tensor = (tensor - mean) / std;
+        }
+
+        return tensor.to(device_);
+    }
+
+    static std::vector<std::string> load_food_classes()
+    {
+        return {
+            "apple_pie","baby_back_ribs","baklava","beef_carpaccio","beef_tartare",
+            "beet_salad","beignets","bibimbap","bread_pudding","breakfast_burrito",
+            "bruschetta","caesar_salad","cannoli","caprese_salad","carrot_cake",
+            "ceviche","cheese_cake","cheese_plate","chicken_curry","chicken_quesadilla",
+            "chicken_wings","chocolate_cake","chocolate_mousse","churros","clam_chowder",
+            "club_sandwich","crab_cakes","creme_brulee","croque_madame","cup_cakes",
+            "deviled_eggs","donuts","dumplings","edamame","eggs_benedict",
+            "escargots","falafel","filet_mignon","fish_and_chips","foie_gras",
+            "french_fries","french_onion_soup","french_toast","fried_calamari","fried_rice",
+            "frozen_yogurt","garlic_bread","gnocchi","greek_salad","grilled_cheese_sandwich",
+            "grilled_salmon","guacamole","gyoza","hamburger","hot_and_sour_soup",
+            "hot_dog","huevos_rancheros","hummus","ice_cream","lasagna",
+            "lobster_bisque","lobster_roll_sandwich","macaroni_and_cheese","macarons","miso_soup",
+            "mussels","nachos","omelette","onion_rings","oysters",
+            "pad_thai","paella","pancakes","panna_cotta","peking_duck",
+            "pho","pizza","pork_chop","poutine","prime_rib",
+            "pulled_pork_sandwich","ramen","ravioli","red_velvet_cake","risotto",
+            "samosa","sashimi","scallops","seaweed_salad","shrimp_and_grits",
+            "spaghetti_bolognese","spaghetti_carbonara","spring_rolls","steak","strawberry_shortcake",
+            "sushi","tacos","takoyaki","tiramisu","tuna_tartare",
+            "waffles"
+        };
+    }
+
+    // ── Members ───────────────────────────────
+    torch::Device              device_{ torch::kCPU };
+    torch::jit::script::Module model_;
+    std::string                model_name_;
+    std::vector<std::string>   food_classes_;
+    ProcessorConfig            processor_;                 // mirrors self.processor in Python
+    float                      confidence_threshold_{ 0.5f };
+};
+
+// ─────────────────────────────────────────────
+// Helper: pretty-print results
+// ─────────────────────────────────────────────
+
+void print_result(const AnalysisResult& result)
+{
+    if (!result.error.empty()) {
+        std::cerr << "Error: " << result.error << "\n";
+        return;
+    }
+
+    std::cout << "Model : " << result.model << "\n";
+    std::cout << "Input : " << result.input_shape[1] << "x"
+                            << result.input_shape[0] << " (WxH)\n";
+
+    if (result.top_prediction.has_value()) {
+        const auto& top = *result.top_prediction;
+        std::cout << "Top   : " << top.food_class
+                  << "  (" << (top.confidence * 100.f) << "%)\n";
+    } else {
+        std::cout << "Top   : none above threshold\n";
+    }
+
+    std::cout << "Predictions:\n";
+    for (size_t i = 0; i < result.predictions.size(); ++i) {
+        const auto& p = result.predictions[i];
+        std::cout << "  " << (i + 1) << ". "
+                  << p.food_class << " — "
+                  << (p.confidence * 100.f) << "%\n";
+    }
+}
+
+// ─────────────────────────────────────────────
+// main() — minimal usage example
+// ─────────────────────────────────────────────
+
+int main(int argc, char* argv[])
+{
+    if (argc < 3) {
+        std::cerr << "Usage: vit_analyzer <model.pt> <image.jpg> [top_k]\n";
+        return 1;
+    }
+
+    const std::string model_path = argv[1];
+    const std::string image_path = argv[2];
+    const int         top_k      = (argc >= 4) ? std::stoi(argv[3]) : 5;
+
+    // Load image
+    cv::Mat image = cv::imread(image_path);
+    if (image.empty()) {
+        std::cerr << "Failed to load image: " << image_path << "\n";
+        return 1;
+    }
+
+    try {
+        ViTAnalyzer analyzer(model_path, /*threshold=*/0.5f);
+
+        AnalysisResult result = analyzer.analyze(image, top_k);
+        print_result(result);
+
+        // Category
+        std::string category = analyzer.get_food_category(result.top_prediction);
+        std::cout << "Category: " << category << "\n";
+
+        // Fine-tune info
+        FineTuneInfo info = analyzer.fine_tune_info();
+        std::cout << "\nFine-tune tips:\n";
+        for (const auto& tip : info.training_tips)
+            std::cout << "  - " << tip << "\n";
+
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
